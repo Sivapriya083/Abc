@@ -436,3 +436,75 @@
 
 
 </robot>
+
+
+import os
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+)
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
+
+
+def launch_setup(context, *args, **kwargs):
+    ur_type = LaunchConfiguration("ur_type")
+    gz_world = LaunchConfiguration("gz_world")
+
+    ur_gazebo_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("ur_simulation_gz"),
+                "launch",
+                "ur_sim_control.launch.py",
+            ])
+        ),
+        launch_arguments={
+            "ur_type": ur_type,
+            "gz_world": gz_world,
+            "launch_rviz": "false",
+        }.items(),
+    )
+
+    return [ur_gazebo_launch]
+
+
+def generate_launch_description():
+    declared_args = [
+        DeclareLaunchArgument(
+            "ur_type",
+            default_value="ur5e",
+            description="Type of UR robot: ur3, ur3e, ur5, ur5e, ur10, ur10e, ur16e",
+        ),
+        DeclareLaunchArgument(
+            "gz_world",
+            default_value="empty.sdf",
+            description="Gazebo world file to load",
+        ),
+    ]
+
+    # Force NVIDIA GPU for OGRE2 rendering
+    env_vars = [
+        SetEnvironmentVariable("__NV_PRIME_RENDER_OFFLOAD", "1"),
+        SetEnvironmentVariable("__GLX_VENDOR_LIBRARY_NAME", "nvidia"),
+        SetEnvironmentVariable(
+            "__EGL_VENDOR_LIBRARY_FILENAMES",
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        ),
+        SetEnvironmentVariable("GZ_IP", "127.0.0.1"),
+        SetEnvironmentVariable("GZ_RELAY", "127.0.0.1"),
+    ]
+
+    return LaunchDescription(env_vars + declared_args + [OpaqueFunction(function=launch_setup)])
+
+
+
+
+
+
+
+
