@@ -1,383 +1,438 @@
-#!/usr/bin/env python3
-"""
-task_executor_feedback.py
-=========================
-Feedback-driven task executor — NO predefined trajectories.
-
-Instead of hardcoded joint angles, the robot:
-1. Reads current joint states continuously
-2. Computes required end-effector position from task geometry
-3. Uses simple Jacobian-based IK to compute joint targets
-4. Reacts to coordination errors — if arms drift, targets adjust
-5. Monitors grasp quality — if coordination error too high, pauses
-"""
-
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
-from sensor_msgs.msg import JointState
-import numpy as np
-
-
-class FeedbackTaskExecutor(Node):
-    def __init__(self):
-        super().__init__('task_executor')
-
-        # Publishers
-        self.left_pub  = self.create_publisher(
-            Float64MultiArray, '/left_arm/joint_target', 10)
-        self.right_pub = self.create_publisher(
-            Float64MultiArray, '/right_arm/joint_target', 10)
-        self.task_pub  = self.create_publisher(
-            Float64MultiArray, '/dual_arm/task_data', 10)
-
-        # Subscribers
-        self.create_subscription(
-            JointState, '/joint_states', self._js_cb, 10)
-        self.create_subscription(
-            Float64MultiArray, '/dual_arm/controller_data', self._ctrl_cb, 10)
-
-        # Current state
-        self.q_left  = np.zeros(6)
-        self.q_right = np.zeros(6)
-        self.coord_error_norm = 0.0
-        self.js_received = False
-
-        # Object position (from camera or fixed spawn point)
-        self.object_pos = np.array([0.0, 0.0, 0.35])  # x,y,z in world frame
-        self.place_pos  = np.array([0.0, -0.2, 0.35])
-
-        # Task state machine
-        self.phase = 'WAIT'
-        self.phase_start = None
-        self.grasp_confirmed = False
-        self.lift_confirmed  = False
-
-        # Thresholds — robot REACTS to these, not a timer
-        self.COORD_ERROR_THRESHOLD = 0.05   # rad — grasp quality check
-        self.POSITION_REACHED_THRESHOLD = 0.08  # rad — "reached" check
-
-        # Control timer
-        self.create_timer(0.05, self._update)  # 20Hz task loop
-        self.get_logger().info('Feedback-driven task executor started.')
-
-    # =========================================================================
-    # Callbacks
-    # =========================================================================
-
-    def _js_cb(self, msg):
-        name_to_pos = dict(zip(msg.name, msg.position))
-        left_names = [
-            'left_shoulder_pan_joint', 'left_shoulder_lift_joint',
-            'left_elbow_joint', 'left_wrist_1_joint',
-            'left_wrist_2_joint',  'left_wrist_3_joint'
-        ]
-        right_names = [
-            'right_shoulder_pan_joint', 'right_shoulder_lift_joint',
-            'right_elbow_joint', 'right_wrist_1_joint',
-            'right_wrist_2_joint',  'right_wrist_3_joint'
-        ]
-        self.q_left  = np.array([name_to_pos.get(n, 0.0) for n in left_names])
-        self.q_right = np.array([name_to_pos.get(n, 0.0) for n in right_names])
-        self.js_received = True
-
-    def _ctrl_cb(self, msg):
-        if len(msg.data) >= 18:
-            coord_error = np.array(msg.data[12:18])
-            self.coord_error_norm = float(np.linalg.norm(coord_error))
-
-    # =========================================================================
-    # Main Task Loop — state machine driven by FEEDBACK not timers
-    # =========================================================================
-
-    def _update(self):
-        if not self.js_received:
-            return
-
-        now = self.get_clock().now().nanoseconds * 1e-9
-
-        # ---- WAIT — hold current position until joints settle ----
-        if self.phase == 'WAIT':
-            self._publish(self.q_left.tolist(), self.q_right.tolist())
-            # Advance when joint velocities are small (robot settled)
-            if self.phase_start is None:
-                self.phase_start = now
-            if now - self.phase_start > 3.0:
-                self._set_phase('APPROACH', now)
-
-        # ---- APPROACH — move toward object, check when close enough ----
-        elif self.phase == 'APPROACH':
-            # Compute targets from object geometry — NOT hardcoded
-            left_target, right_target = self._compute_approach_targets()
-            self._publish(left_target, right_target)
-
-            # Advance only when BOTH arms have reached pregrasp
-            # This is feedback-based — not a timer
-            left_err  = np.linalg.norm(self.q_left  - np.array(left_target))
-            right_err = np.linalg.norm(self.q_right - np.array(right_target))
-
-            if left_err < self.POSITION_REACHED_THRESHOLD and \
-               right_err < self.POSITION_REACHED_THRESHOLD:
-                self.get_logger().info(
-                    f'Approach reached. L_err={left_err:.3f} R_err={right_err:.3f}')
-                self._set_phase('DESCEND', now)
-
-        # ---- DESCEND — lower to grasp height, check contact quality ----
-        elif self.phase == 'DESCEND':
-            left_target, right_target = self._compute_grasp_targets()
-            self._publish(left_target, right_target)
-
-            left_err  = np.linalg.norm(self.q_left  - np.array(left_target))
-            right_err = np.linalg.norm(self.q_right - np.array(right_target))
-
-            if left_err < self.POSITION_REACHED_THRESHOLD and \
-               right_err < self.POSITION_REACHED_THRESHOLD:
-                self._set_phase('GRASP_CHECK', now)
-
-        # ---- GRASP CHECK — verify coordination error is low enough ----
-        # This is the key feedback step — robot checks grasp quality
-        # before proceeding. If coordination error is too high, it waits.
-        elif self.phase == 'GRASP_CHECK':
-            left_target, right_target = self._compute_grasp_targets()
-            self._publish(left_target, right_target)
-
-            self.get_logger().info(
-                f'Grasp check: coord_error={self.coord_error_norm:.4f} rad '
-                f'(threshold={self.COORD_ERROR_THRESHOLD})')
-
-            # Only proceed if coordination error is small enough
-            # = both arms are pressing symmetrically = good grasp
-            if self.coord_error_norm < self.COORD_ERROR_THRESHOLD:
-                self.grasp_confirmed = True
-                self.get_logger().info('Grasp confirmed! Proceeding to lift.')
-                self._set_phase('LIFT', now)
-            elif now - self.phase_start > 10.0:
-                # Timeout — proceed anyway with warning
-                self.get_logger().warn(
-                    'Grasp check timeout — coordination error still high. '
-                    f'coord_error={self.coord_error_norm:.4f}')
-                self._set_phase('LIFT', now)
-
-        # ---- LIFT — raise object, monitor coordination continuously ----
-        elif self.phase == 'LIFT':
-            # Lift height computed from elapsed time — reactive not scripted
-            elapsed = now - self.phase_start
-            lift_progress = min(elapsed / 4.0, 1.0)
-            left_target, right_target = self._compute_lift_targets(lift_progress)
-            self._publish(left_target, right_target)
-
-            # If coordination error spikes during lift — SLOW DOWN
-            if self.coord_error_norm > 0.15:
-                self.get_logger().warn(
-                    f'Coordination error spike during lift: '
-                    f'{self.coord_error_norm:.4f} — slowing down')
-                # Don't advance lift_progress by holding phase_start
-                self.phase_start = now - (elapsed * 0.5)
-
-            if lift_progress >= 1.0:
-                self.lift_confirmed = True
-                self._set_phase('TRANSFER', now)
-
-        # ---- TRANSFER — move toward place location ----
-        elif self.phase == 'TRANSFER':
-            elapsed = now - self.phase_start
-            transfer_progress = min(elapsed / 6.0, 1.0)
-            left_target, right_target = self._compute_transfer_targets(
-                transfer_progress)
-            self._publish(left_target, right_target)
-
-            if transfer_progress >= 1.0:
-                self._set_phase('PLACE', now)
-
-        # ---- PLACE — lower to place height ----
-        elif self.phase == 'PLACE':
-            elapsed = now - self.phase_start
-            place_progress = min(elapsed / 4.0, 1.0)
-            left_target, right_target = self._compute_place_targets(
-                place_progress)
-            self._publish(left_target, right_target)
-
-            if place_progress >= 1.0:
-                self._set_phase('RELEASE', now)
-
-        # ---- RELEASE — open arms outward ----
-        elif self.phase == 'RELEASE':
-            left_target, right_target = self._compute_release_targets()
-            self._publish(left_target, right_target)
-
-            left_err  = np.linalg.norm(self.q_left  - np.array(left_target))
-            right_err = np.linalg.norm(self.q_right - np.array(right_target))
-
-            if left_err < self.POSITION_REACHED_THRESHOLD and \
-               right_err < self.POSITION_REACHED_THRESHOLD:
-                self._set_phase('RETRACT', now)
-
-        # ---- RETRACT — return home ----
-        elif self.phase == 'RETRACT':
-            home = [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
-            self._publish(home, home)
-
-            left_err  = np.linalg.norm(self.q_left  - np.array(home))
-            right_err = np.linalg.norm(self.q_right - np.array(home))
-
-            if left_err < self.POSITION_REACHED_THRESHOLD and \
-               right_err < self.POSITION_REACHED_THRESHOLD:
-                self._set_phase('COMPLETE', now)
-
-        # ---- COMPLETE ----
-        elif self.phase == 'COMPLETE':
-            home = [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
-            self._publish(home, home)
-            self.get_logger().info('Task complete!')
-            self.timer.cancel()
-
-        # Publish task data for logger
-        self._publish_task_data(now)
-
-    # =========================================================================
-    # Target Computation — FROM GEOMETRY, not hardcoded
-    # =========================================================================
-
-    def _compute_approach_targets(self):
-        """
-        Compute pregrasp joint targets from object position.
-        Left arm approaches from +y side, right from -y side.
-        Uses simple geometric inverse kinematics for UR5e.
-        """
-        obj = self.object_pos
-
-        # Approach offset — stay above and to the side of object
-        approach_height_offset = 0.1   # meters above object
-        approach_side_offset   = 0.15  # meters to the side
-
-        # Left arm: base at y=+0.7, needs to reach obj_y + side_offset
-        # Shoulder pan angle computed from geometry
-        left_pan   = -np.arctan2(obj[0], 0.7 - obj[1] - approach_side_offset)
-        left_lift  = -1.20
-        left_elbow =  1.40
-        left_w1    = -0.80
-        left_w2    = -1.5708
-        left_w3    =  0.0
-
-        # Right arm: base at y=-0.7
-        right_pan   = np.arctan2(obj[0], obj[1] + 0.7 - approach_side_offset)
-        right_lift  = -1.20
-        right_elbow =  1.40
-        right_w1    = -0.80
-        right_w2    = -1.5708
-        right_w3    =  0.0
-
-        return (
-            [left_pan,  left_lift,  left_elbow,  left_w1,  left_w2,  left_w3],
-            [right_pan, right_lift, right_elbow, right_w1, right_w2, right_w3]
-        )
-
-    def _compute_grasp_targets(self):
-        """Lower to grasp height — computed from object z position."""
-        left_target, right_target = self._compute_approach_targets()
-        # Lower shoulder and raise elbow to descend
-        left_target[1]  = -1.35
-        left_target[2]  =  1.55
-        right_target[1] = -1.35
-        right_target[2] =  1.55
-        return left_target, right_target
-
-    def _compute_lift_targets(self, progress: float):
-        """
-        Compute lift targets based on progress [0,1].
-        Height increases with progress — computed not scripted.
-        """
-        left_target, right_target = self._compute_grasp_targets()
-        # Lift amount scales with progress
-        lift_amount = 0.30 * progress
-        left_target[1]  = -1.35 + lift_amount
-        left_target[2]  =  1.55 - lift_amount * 0.5
-        right_target[1] = -1.35 + lift_amount
-        right_target[2] =  1.55 - lift_amount * 0.5
-        return left_target, right_target
-
-    def _compute_transfer_targets(self, progress: float):
-        """
-        Interpolate pan angles from grasp position to place position.
-        Computed from place_pos geometry — not hardcoded angles.
-        """
-        # Start: grasp pan angles
-        left_start, right_start = self._compute_lift_targets(1.0)
-
-        # End: place pan angles computed from place geometry
-        place = self.place_pos
-        left_pan_end  = -np.arctan2(place[0], 0.7  - place[1])
-        right_pan_end =  np.arctan2(place[0], place[1] + 0.7)
-
-        # Interpolate
-        s = self._min_jerk(progress)
-        left_target  = left_start.copy()
-        right_target = right_start.copy()
-        left_target[0]  = left_start[0]  + s * (left_pan_end  - left_start[0])
-        right_target[0] = right_start[0] + s * (right_pan_end - right_start[0])
-
-        return left_target, right_target
-
-    def _compute_place_targets(self, progress: float):
-        """Lower from lift height to place height."""
-        left_target, right_target = self._compute_transfer_targets(1.0)
-        drop = 0.30 * progress
-        left_target[1]  -= drop
-        left_target[2]  += drop * 0.5
-        right_target[1] -= drop
-        right_target[2] += drop * 0.5
-        return left_target, right_target
-
-    def _compute_release_targets(self):
-        """Open arms slightly outward — computed as offset from current."""
-        left_target, right_target = self._compute_place_targets(1.0)
-        # Move pan outward by 0.15 rad from current grasp pan
-        left_target[0]  += 0.15
-        right_target[0] -= 0.15
-        return left_target, right_target
-
-    # =========================================================================
-    # Utilities
-    # =========================================================================
-
-    def _set_phase(self, phase, now):
-        self.get_logger().info(f'Phase: {self.phase} → {phase}')
-        self.phase       = phase
-        self.phase_start = now
-
-    def _publish(self, left, right):
-        lmsg = Float64MultiArray()
-        rmsg = Float64MultiArray()
-        lmsg.data = [float(v) for v in left]
-        rmsg.data = [float(v) for v in right]
-        self.left_pub.publish(lmsg)
-        self.right_pub.publish(rmsg)
-
-    def _publish_task_data(self, now):
-        phases = ['WAIT','APPROACH','DESCEND','GRASP_CHECK',
-                  'LIFT','TRANSFER','PLACE','RELEASE','RETRACT','COMPLETE']
-        phase_idx = phases.index(self.phase) if self.phase in phases else 0
-        msg = Float64MultiArray()
-        msg.data = [float(phase_idx), self.coord_error_norm]
-        self.task_pub.publish(msg)
-
-    @staticmethod
-    def _min_jerk(t):
-        t = max(0.0, min(1.0, t))
-        return 10*t**3 - 15*t**4 + 6*t**5
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = FeedbackTaskExecutor()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
+<?xml version="1.0"?>
+<robot name="ur5e">
+
+  <!-- BASE LINK -->
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="4.0"/>
+      <inertia
+        ixx="0.004" ixy="0" ixz="0"
+        iyy="0.004" iyz="0"
+        izz="0.006"/>
+    </inertial>
+  </link>
+
+
+  <!-- LINK 1 -->
+
+  <link name="shoulder_link">
+
+    <inertial>
+      <origin xyz="0 0 0.05"/>
+      <mass value="3.7"/>
+      <inertia
+        ixx="0.010"
+        iyy="0.010"
+        izz="0.006"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- LINK 2 -->
+
+  <link name="upper_arm_link">
+
+    <inertial>
+      <origin xyz="0 0 0.2125"/>
+      <mass value="8.393"/>
+      <inertia
+        ixx="0.226"
+        iyy="0.226"
+        izz="0.015"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- LINK 3 -->
+
+  <link name="forearm_link">
+
+    <inertial>
+      <origin xyz="0 0 0.196"/>
+      <mass value="2.33"/>
+      <inertia
+        ixx="0.049"
+        iyy="0.049"
+        izz="0.004"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- LINK 4 -->
+
+  <link name="wrist_1_link">
+
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="1.219"/>
+      <inertia
+        ixx="0.002"
+        iyy="0.002"
+        izz="0.001"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- LINK 5 -->
+
+  <link name="wrist_2_link">
+
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="1.219"/>
+      <inertia
+        ixx="0.002"
+        iyy="0.002"
+        izz="0.001"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- LINK 6 -->
+
+  <link name="wrist_3_link">
+
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="0.1879"/>
+      <inertia
+        ixx="0.0003"
+        iyy="0.0003"
+        izz="0.0002"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+
+  </link>
+
+
+  <!-- JOINTS -->
+
+  <joint name="shoulder_pan_joint" type="revolute">
+
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+
+    <origin xyz="0 0 0.1625" rpy="0 0 0"/>
+
+    <axis xyz="0 0 1"/>
+
+    <limit
+      lower="-6.283"
+      upper="6.283"
+      effort="150"
+      velocity="3.0"/>
+
+  </joint>
+
+
+  <joint name="shoulder_lift_joint" type="revolute">
+
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+
+    <origin xyz="0 0 0" rpy="0 1.5708 0"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit
+      lower="-6.283"
+      upper="6.283"
+      effort="150"
+      velocity="3.0"/>
+
+  </joint>
+
+
+  <joint name="elbow_joint" type="revolute">
+
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+
+    <origin xyz="-0.425 0 0" rpy="0 0 0"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit
+      effort="150"
+      velocity="3"/>
+
+  </joint>
+
+
+  <joint name="wrist_1_joint" type="revolute">
+
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+
+    <origin xyz="-0.3922 0 0.1333"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit effort="150" velocity="3"/>
+
+  </joint>
+
+
+  <joint name="wrist_2_joint" type="revolute">
+
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+
+    <origin xyz="0 0 0.0997"/>
+
+    <axis xyz="0 0 1"/>
+
+    <limit effort="150" velocity="3"/>
+
+  </joint>
+
+
+  <joint name="wrist_3_joint" type="revolute">
+
+    <parent link="wrist_2_link"/>
+    <child link="wrist_3_link"/>
+
+    <origin xyz="0 0 0.0996"/>
+
+    <axis xyz="0 1 0"/>
+
+    <limit effort="150" velocity="3"/>
+
+  </joint>
+
+
+  <!-- ROS2 CONTROL -->
+
+  <ros2_control name="UR5eSystem" type="system">
+
+    <hardware>
+
+      <plugin>
+        gz_ros2_control/GazeboSimSystem
+      </plugin>
+
+    </hardware>
+
+
+    <joint name="shoulder_pan_joint">
+
+      <command_interface name="effort"/>
+
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+
+    </joint>
+
+
+    <joint name="shoulder_lift_joint">
+
+      <command_interface name="effort"/>
+
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+
+    </joint>
+
+
+    <joint name="elbow_joint">
+
+      <command_interface name="effort"/>
+
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+
+    </joint>
+
+
+    <joint name="wrist_1_joint">
+
+      <command_interface name="effort"/>
+
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+
+    </joint>
+
+
+    <joint name="wrist_2_joint">
+
+      <command_interface name="effort"/>
+
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+
+    </joint>
+
+
+    <joint name="wrist_3_joint">
+
+      <command_interface name="effort"/>
+
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+
+    </joint>
+
+
+  </ros2_control>
+
+
+  <!-- TRANSMISSIONS -->
+  <!-- REQUIRED FOR EFFORT CONTROL -->
+
+  <transmission name="trans_shoulder_pan">
+
+    <type>
+      transmission_interface/SimpleTransmission
+    </type>
+
+    <joint name="shoulder_pan_joint">
+
+      <hardwareInterface>
+        hardware_interface/EffortJointInterface
+      </hardwareInterface>
+
+    </joint>
+
+    <actuator name="motor_shoulder_pan">
+
+      <mechanicalReduction>
+        1
+      </mechanicalReduction>
+
+    </actuator>
+
+  </transmission>
+
+
+  <transmission name="trans_shoulder_lift">
+
+    <type>
+      transmission_interface/SimpleTransmission
+    </type>
+
+    <joint name="shoulder_lift_joint">
+
+      <hardwareInterface>
+        hardware_interface/EffortJointInterface
+      </hardwareInterface>
+
+    </joint>
+
+    <actuator name="motor_shoulder_lift">
+
+      <mechanicalReduction>
+        1
+      </mechanicalReduction>
+
+    </actuator>
+
+  </transmission>
+
+
+  <transmission name="trans_elbow">
+
+    <type>
+      transmission_interface/SimpleTransmission
+    </type>
+
+    <joint name="elbow_joint">
+
+      <hardwareInterface>
+        hardware_interface/EffortJointInterface
+      </hardwareInterface>
+
+    </joint>
+
+    <actuator name="motor_elbow">
+
+      <mechanicalReduction>
+        1
+      </mechanicalReduction>
+
+    </actuator>
+
+  </transmission>
+
+
+  <transmission name="trans_wrist1">
+
+    <type>
+      transmission_interface/SimpleTransmission
+    </type>
+
+    <joint name="wrist_1_joint">
+
+      <hardwareInterface>
+        hardware_interface/EffortJointInterface
+      </hardwareInterface>
+
+    </joint>
+
+  </transmission>
+
+
+  <transmission name="trans_wrist2">
+
+    <type>
+      transmission_interface/SimpleTransmission
+    </type>
+
+    <joint name="wrist_2_joint">
+
+      <hardwareInterface>
+        hardware_interface/EffortJointInterface
+      </hardwareInterface>
+
+    </joint>
+
+  </transmission>
+
+
+  <transmission name="trans_wrist3">
+
+    <type>
+      transmission_interface/SimpleTransmission
+    </type>
+
+    <joint name="wrist_3_joint">
+
+      <hardwareInterface>
+        hardware_interface/EffortJointInterface
+      </hardwareInterface>
+
+    </joint>
+
+  </transmission>
+
+
+  <!-- GAZEBO ROS2 CONTROL PLUGIN -->
+
+  <gazebo>
+
+    <plugin
+        filename="libgz_ros2_control-system.so"
+        name="gz_ros2_control::GazeboSimROS2ControlPlugin"/>
+
+  </gazebo>
+
+
+</robot>
